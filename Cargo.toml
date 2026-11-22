@@ -8,6 +8,3 @@ license = "MIT OR Apache-2.0"
 description = "Efficient Lexicographic Encoding of Numbers: order-preserving text encodings"
 keywords = ["encoding", "lexicographic", "sortable", "keys", "elen"]
 categories = ["encoding", "no-std", "database"]
-
-[dependencies]
-thiserror = "2"

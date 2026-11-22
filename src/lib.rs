@@ -1,267 +1,133 @@
-use std::{fmt::Display, num::TryFromIntError, str::FromStr};
+//! Efficient Lexicographic Encoding of Numbers (ELEN).
+//!
+//! Text encodings of numbers whose byte-wise lexicographic order is their numeric order, after
+//! Peter Seymour's paper ["Efficient Lexicographic Encoding of Numbers"][paper]. Every integer
+//! type shares one number line: `5u8`, `5u64` and `5i64` all encode as `;5`, and an encoding of
+//! any integer sorts correctly against an encoding of any other.
+//!
+//! The paper writes its markers as `-` and `+`, ordered below and above the digits. ASCII `+`
+//! sorts below the digits, so this crate writes [`POSITIVE`] (`;`) in its place:
+//!
+//! ```text
+//! -1234567891 → ---7898765432108
+//!         -10 → --789
+//!          -1 → -8
+//!           0 → 0
+//!           1 → ;1
+//!          10 → ;;210
+//!  1234567890 → ;;;2101234567890
+//! ```
+//!
+//! Decoding is strict: it accepts only the encoder's own spelling of each number, so a string
+//! decodes successfully exactly when it is the encoding of the value it decodes to.
+//!
+//! [paper]: https://www.zanopha.com/docs/elen.pdf
 
-use thiserror::Error;
+use std::{fmt::Display, str::FromStr};
 
-#[derive(Error, Debug)]
-pub enum ElenError {
-    #[error("{0} is not a valid ELEN string")]
-    InvalidString(String),
+mod error;
+mod int;
 
-    #[error("decode error: {0}")]
-    DecodeError(#[from] TryFromIntError),
+pub use error::Error;
 
-    #[error("invalid signed integer format: {0}")]
-    InvalidSignedFormat(String),
-}
+/// The error type's former name.
+pub type ElenError = Error;
 
+/// Marks a positive number; sorts above every digit. The paper's `+`.
+pub const POSITIVE: char = ';';
+/// Marks a negative number; sorts below every digit. The paper's `-`.
+pub const NEGATIVE: char = '-';
+/// The encoding of zero.
+pub const ZERO: char = '0';
+
+/// A validated ELEN encoding of an integer.
+///
+/// `Elen`s compare in numeric order, since their bytes do.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Elen(String);
-const LENGTH_RUNE: &str = ";";
 
-/// Prefix for negative signed integers in ELEN encoding.
-/// Using '!' (ASCII 33) ensures negative numbers sort before positive ones lexicographically,
-/// since '!' < '~' in ASCII.
-const NEGATIVE_PREFIX: char = '!';
+macro_rules! primitive {
+    ($($t:ty => $encode:ident, $decode:ident;)*) => {
+        impl Elen {
+            $(
+                #[doc = concat!("Encodes a `", stringify!($t), "`.")]
+                pub fn $encode(i: $t) -> Self {
+                    let mut s = String::with_capacity(int::primitive_encoded_len(i));
+                    int::encode_primitive(i, &mut s).expect("writing to a String cannot fail");
+                    Self(s)
+                }
 
-/// Prefix for non-negative signed integers in ELEN encoding.
-/// Using '~' (ASCII 126) ensures non-negative numbers sort after negative ones lexicographically.
-const NON_NEGATIVE_PREFIX: char = '~';
-
-/// Encode a signed 128-bit integer to a lexicographically sortable string.
-///
-/// The encoding uses a prefix to ensure correct sort order:
-/// - Negative numbers are prefixed with '-' and use a complemented representation
-///   so that larger (less negative) numbers have larger encoded values.
-/// - Non-negative numbers are prefixed with '+' and encoded normally.
-///
-/// For negative numbers, we use: encoded_value = i128::MAX + value + 1
-/// This maps:
-///   i128::MIN (-170141183460469231731687303715884105728) -> 0
-///   -1                                                  -> i128::MAX (170141183460469231731687303715884105727)
-///
-/// This ensures that for any a < b (as signed integers), encode_i128(a) < encode_i128(b)
-/// in lexicographic order.
-fn encode_i128(i: i128) -> String {
-    if i < 0 {
-        // For negative numbers, we compute: i128::MAX + value + 1
-        // where value is negative, so this equals i128::MAX - |value| + 1
-        // Using wrapping arithmetic to handle i128::MIN correctly:
-        // i128::MIN wraps to 0, -1 maps to i128::MAX
-        let inverted = i.wrapping_add(i128::MAX).wrapping_add(1) as u128;
-        format!("{}{}", NEGATIVE_PREFIX, encode_u128(inverted))
-    } else {
-        format!("{}{}", NON_NEGATIVE_PREFIX, encode_u128(i as u128))
-    }
-}
-
-/// Decode a signed 128-bit integer from an ELEN-encoded string.
-fn decode_i128(s: &str) -> Result<i128, ElenError> {
-    if s.is_empty() {
-        return Err(ElenError::InvalidSignedFormat(s.to_owned()));
-    }
-
-    let first_char = s.chars().next().unwrap();
-    let rest = &s[1..];
-
-    match first_char {
-        NEGATIVE_PREFIX => {
-            let inverted = decode_u128(rest)?;
-            // Reverse the encoding: value = inverted - i128::MAX - 1
-            // Using wrapping arithmetic to handle the full range
-            let result = (inverted as i128).wrapping_sub(i128::MAX).wrapping_sub(1);
-            Ok(result)
+                #[doc = concat!("Decodes a `", stringify!($t), "`, failing with [`Error::OutOfRange`] when the number does not fit.")]
+                pub fn $decode(&self) -> Result<$t, Error> {
+                    int::finish(&self.0, int::decode_primitive_prefix(&self.0)?)
+                }
+            )*
         }
-        NON_NEGATIVE_PREFIX => {
-            let value = decode_u128(rest)?;
-            if value > i128::MAX as u128 {
-                return Err(ElenError::InvalidSignedFormat(format!(
-                    "value {} exceeds i128::MAX",
-                    value
-                )));
+
+        $(
+            impl From<$t> for Elen {
+                fn from(value: $t) -> Self {
+                    Elen::$encode(value)
+                }
             }
-            Ok(value as i128)
-        }
-        _ => Err(ElenError::InvalidSignedFormat(format!(
-            "expected '{}' or '{}' prefix, got '{}'",
-            NEGATIVE_PREFIX, NON_NEGATIVE_PREFIX, first_char
-        ))),
-    }
+
+            impl TryFrom<&Elen> for $t {
+                type Error = Error;
+
+                fn try_from(value: &Elen) -> Result<Self, Self::Error> {
+                    value.$decode()
+                }
+            }
+
+            impl TryFrom<Elen> for $t {
+                type Error = Error;
+
+                fn try_from(value: Elen) -> Result<Self, Self::Error> {
+                    value.$decode()
+                }
+            }
+        )*
+    };
 }
 
-fn encode_u128(i: u128) -> String {
-    let mut s = String::new();
-    if i > 0 {
-        s.push_str(LENGTH_RUNE);
-    }
-    let i_string = i.to_string();
-    let i_string_length = i_string.len();
-    if i_string_length > 1 {
-        s.push_str(&encode_u128(i_string_length as u128));
-    }
-    s.push_str(&i_string);
-    s
-}
-
-/// Slice `s[position .. position + len]`, returning `InvalidString` instead of **panicking** when the
-/// range is out of bounds, its end overflows `usize`, or an endpoint is not on a UTF-8 char boundary.
-///
-/// ELEN decode advertises a `Result` contract, but a corrupt or crafted token (an empty or degenerate
-/// length component) could make the raw `&s[..]` slices index out of bounds and panic *before* the
-/// `?` could map the error — bypassing every caller's error handling (#250). `str::get` closes that.
-fn elen_slice(s: &str, position: usize, len: u128) -> Result<&str, ElenError> {
-    let len = usize::try_from(len).map_err(|_| ElenError::InvalidString(s.to_owned()))?;
-    let end = position
-        .checked_add(len)
-        .ok_or_else(|| ElenError::InvalidString(s.to_owned()))?;
-    s.get(position..end)
-        .ok_or_else(|| ElenError::InvalidString(s.to_owned()))
-}
-
-fn decode_u128(s: &str) -> Result<u128, ElenError> {
-    let total_elements: usize = s.chars().take_while(|&c| c == ';').count();
-    let mut elements_remaining = total_elements;
-    let mut position = total_elements;
-    let mut next_parse_length: u128 = 1;
-    while elements_remaining > 1 {
-        let length_string = elen_slice(s, position, next_parse_length)?;
-        next_parse_length = length_string
-            .parse()
-            .map_err(|_| ElenError::InvalidString(s.to_owned()))?;
-        position += length_string.len();
-        elements_remaining -= 1;
-    }
-    let element = elen_slice(s, position, next_parse_length)?;
-    let result = element
-        .parse()
-        .map_err(|_| ElenError::InvalidString(s.to_owned()))?;
-    Ok(result)
+primitive! {
+    u8 => encode_u8, decode_u8;
+    u16 => encode_u16, decode_u16;
+    u32 => encode_u32, decode_u32;
+    u64 => encode_u64, decode_u64;
+    u128 => encode_u128, decode_u128;
+    usize => encode_usize, decode_usize;
+    i8 => encode_i8, decode_i8;
+    i16 => encode_i16, decode_i16;
+    i32 => encode_i32, decode_i32;
+    i64 => encode_i64, decode_i64;
+    i128 => encode_i128, decode_i128;
+    isize => encode_isize, decode_isize;
 }
 
 impl Elen {
-    // pub fn encode_i8(i: i8) -> String {
-    //     todo!()
-    // }
-
-    pub fn encode_u8(i: u8) -> Self {
-        Self::encode_u128(i as u128)
-    }
-
-    // pub fn encode_i16(i: i16) -> Self {
-    //     todo!()
-    // }
-
-    pub fn encode_u16(i: u16) -> Self {
-        Self::encode_u128(i as u128)
-    }
-
-    // pub fn encode_i32(i: i32) -> Self {
-    //     todo!()
-    // }
-
-    pub fn encode_u32(i: u32) -> Self {
-        Self::encode_u128(i as u128)
-    }
-
-    pub fn encode_i64(i: i64) -> Self {
-        Self(encode_i128(i as i128))
-    }
-
-    pub fn encode_u64(i: u64) -> Self {
-        Self::encode_u128(i as u128)
-    }
-
-    // pub fn encode_i128(i: i128) -> Self {
-    //     todo!()
-    // }
-
-    pub fn encode_u128(i: u128) -> Self {
-        Self(encode_u128(i))
-    }
-
-    // pub fn encode_isize(i: isize) -> Self {
-    //     todo!()
-    // }
-
-    pub fn encode_usize(i: usize) -> Self {
-        Self::encode_u128(i as u128)
-    }
-
-    // pub fn decode_i8(&self) -> Result<i8, ElenError> {
-    //     todo!()
-    // }
-
-    pub fn decode_u8(&self) -> Result<u8, ElenError> {
-        decode_u128(&self.0)?
-            .try_into()
-            .map_err(ElenError::DecodeError)
-    }
-
-    // pub fn decode_i16(&self) -> Result<i16, ElenError> {
-    //     todo!()
-    // }
-
-    pub fn decode_u16(&self) -> Result<u16, ElenError> {
-        decode_u128(&self.0)?
-            .try_into()
-            .map_err(ElenError::DecodeError)
-    }
-
-    // pub fn decode_i32(&self) -> Result<i32, ElenError> {
-    //     todo!()
-    // }
-
-    pub fn decode_u32(&self) -> Result<u32, ElenError> {
-        decode_u128(&self.0)?
-            .try_into()
-            .map_err(ElenError::DecodeError)
-    }
-
-    pub fn decode_i64(&self) -> Result<i64, ElenError> {
-        decode_i128(&self.0)?
-            .try_into()
-            .map_err(ElenError::DecodeError)
-    }
-
-    pub fn decode_u64(&self) -> Result<u64, ElenError> {
-        decode_u128(&self.0)?
-            .try_into()
-            .map_err(ElenError::DecodeError)
-    }
-
-    // pub fn decode_i128(&self) -> Result<i128, ElenError> {
-    //     todo!()
-    // }
-
-    pub fn decode_u128(&self) -> Result<u128, ElenError> {
-        decode_u128(&self.0)
-    }
-
-    // pub fn decode_isize(&self) -> Result<isize, ElenError> {
-    //     todo!()
-    // }
-
-    pub fn decode_usize(&self) -> Result<usize, ElenError> {
-        decode_u128(&self.0)?
-            .try_into()
-            .map_err(ElenError::DecodeError)
+    /// The encoding.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
 impl FromStr for Elen {
-    type Err = ElenError;
+    type Err = Error;
 
+    /// Validates that `s` is exactly the encoding of some integer, of any size.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match decode_u128(s) {
-            Ok(_) => Ok(Self(s.to_owned())),
-            Err(e) => Err(e),
-        }
+        let token = int::read(s, usize::MAX)?;
+        int::finish(s, ((), &s[token.end..]))?;
+        Ok(Self(s.to_owned()))
     }
 }
 
 impl TryFrom<&str> for Elen {
-    type Error = ElenError;
+    type Error = Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Elen::from_str(value)
+        value.parse()
     }
 }
 
@@ -277,133 +143,85 @@ impl From<Elen> for String {
     }
 }
 
-impl From<u8> for Elen {
-    fn from(value: u8) -> Self {
-        Elen::encode_u8(value)
-    }
-}
-
-impl TryInto<u8> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<u8, Self::Error> {
-        self.decode_u8()
-    }
-}
-
-impl From<u16> for Elen {
-    fn from(value: u16) -> Self {
-        Elen::encode_u16(value)
-    }
-}
-
-impl TryInto<u16> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<u16, Self::Error> {
-        self.decode_u16()
-    }
-}
-
-impl From<u32> for Elen {
-    fn from(value: u32) -> Self {
-        Elen::encode_u32(value)
-    }
-}
-
-impl TryInto<u32> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<u32, Self::Error> {
-        self.decode_u32()
-    }
-}
-
-impl From<u64> for Elen {
-    fn from(value: u64) -> Self {
-        Elen::encode_u64(value)
-    }
-}
-
-impl TryInto<u64> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<u64, Self::Error> {
-        self.decode_u64()
-    }
-}
-
-impl From<u128> for Elen {
-    fn from(value: u128) -> Self {
-        Elen::encode_u128(value)
-    }
-}
-
-impl TryInto<u128> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<u128, Self::Error> {
-        self.decode_u128()
-    }
-}
-
-impl From<usize> for Elen {
-    fn from(value: usize) -> Self {
-        Elen::encode_usize(value)
-    }
-}
-
-impl TryInto<usize> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<usize, Self::Error> {
-        self.decode_usize()
-    }
-}
-
-impl From<i64> for Elen {
-    fn from(value: i64) -> Self {
-        Elen::encode_i64(value)
-    }
-}
-
-impl TryInto<i64> for Elen {
-    type Error = ElenError;
-
-    fn try_into(self) -> Result<i64, Self::Error> {
-        self.decode_i64()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The integer table from §3 of the paper, with `+` written as `;`.
+    const PAPER_INTEGERS: &[(i64, &str)] = &[
+        (-1234567891, "---7898765432108"),
+        (-1234567890, "---7898765432109"),
+        (-1234567889, "---7898765432110"),
+        (-11, "--788"),
+        (-10, "--789"),
+        (-9, "-0"),
+        (-2, "-7"),
+        (-1, "-8"),
+        (0, "0"),
+        (1, ";1"),
+        (2, ";2"),
+        (9, ";9"),
+        (10, ";;210"),
+        (11, ";;211"),
+        (1234567889, ";;;2101234567889"),
+        (1234567890, ";;;2101234567890"),
+        (1234567891, ";;;2101234567891"),
+    ];
+
     #[test]
-    fn round_trip() {
-        let inputs: Vec<u128> = vec![
-            0,
-            1,
-            999_999_999,
-            1_000_000_000,
-            123_123_123_123_123,
-            123_123_123_123_123_123_123_123_123_123_123,
-        ];
-        for input in inputs {
-            let s = encode_u128(input);
-            let output = decode_u128(&s).unwrap();
-            println!(
-                "input: {}, encoded_string: {}, output: {}",
-                input, s, output
+    fn paper_vectors() {
+        for &(n, s) in PAPER_INTEGERS {
+            assert_eq!(Elen::from(n).as_str(), s, "encode({n})");
+            assert_eq!(
+                s.parse::<Elen>().unwrap().decode_i64().unwrap(),
+                n,
+                "decode({s})"
             );
-            assert_eq!(input, output);
+        }
+        for pair in PAPER_INTEGERS.windows(2) {
+            assert!(pair[0].1 < pair[1].1, "{} < {}", pair[0].1, pair[1].1);
         }
     }
 
+    /// Non-negative numbers keep the spelling of the encoder this crate was extracted from, so
+    /// unsigned encodings already stored stay valid.
     #[test]
-    fn round_trip_signed() {
-        let inputs: Vec<i128> = vec![
+    fn unsigned_encodings_match_the_extracted_encoder() {
+        fn extracted(i: u128) -> String {
+            let mut s = String::new();
+            if i > 0 {
+                s.push(';');
+            }
+            let digits = i.to_string();
+            if digits.len() > 1 {
+                s.push_str(&extracted(digits.len() as u128));
+            }
+            s.push_str(&digits);
+            s
+        }
+        let mut n = 1u128;
+        for _ in 0..39 {
+            for v in [n - 1, n, n + 1, n.saturating_mul(7) / 3] {
+                assert_eq!(Elen::from(v).as_str(), extracted(v));
+            }
+            n = n.saturating_mul(10);
+        }
+        assert_eq!(Elen::from(u128::MAX).as_str(), extracted(u128::MAX));
+    }
+
+    #[test]
+    fn every_type_shares_one_number_line() {
+        assert_eq!(Elen::from(5u8), Elen::from(5i64));
+        assert_eq!(Elen::from(5u128), Elen::from(5isize));
+        assert_eq!(Elen::from(-5i8), Elen::from(-5i128));
+        assert_eq!(Elen::from(u64::MAX), Elen::from(u64::MAX as i128));
+    }
+
+    #[test]
+    fn extremes_round_trip_and_order() {
+        let values = [
             i128::MIN,
+            i128::MIN + 1,
             i64::MIN as i128,
             -1_000_000_000,
             -1,
@@ -413,147 +231,113 @@ mod tests {
             i64::MAX as i128,
             i128::MAX,
         ];
-        for input in inputs {
-            let s = encode_i128(input);
-            let output = decode_i128(&s).unwrap();
-            println!(
-                "input: {}, encoded_string: {}, output: {}",
-                input, s, output
-            );
-            assert_eq!(input, output);
+        let encoded: Vec<Elen> = values.iter().map(|&v| Elen::from(v)).collect();
+        for (v, e) in values.iter().zip(&encoded) {
+            assert_eq!(e.decode_i128().unwrap(), *v);
+        }
+        assert!(encoded.windows(2).all(|w| w[0] < w[1]));
+        assert_eq!(Elen::from(u128::MAX).decode_u128().unwrap(), u128::MAX);
+        assert!(Elen::from(i128::MAX) < Elen::from(u128::MAX));
+    }
+
+    #[test]
+    fn exhaustive_16_bit() {
+        let mut previous: Option<Elen> = None;
+        for v in i16::MIN..=i16::MAX {
+            let e = Elen::from(v);
+            assert_eq!(e.decode_i16().unwrap(), v);
+            assert_eq!(e.as_str().parse::<Elen>().unwrap(), e);
+            if let Some(p) = previous {
+                assert!(p < e, "{p} < {e}");
+            }
+            previous = Some(e);
+        }
+        for v in 0..=u16::MAX {
+            assert_eq!(Elen::from(v).decode_u16().unwrap(), v);
         }
     }
 
     #[test]
-    fn signed_ordering() {
-        // Test that lexicographic ordering of encoded strings matches numeric ordering
-        let values: Vec<i128> = vec![
-            i128::MIN,
-            i64::MIN as i128,
-            -1_000_000_000,
-            -100,
-            -10,
-            -1,
-            0,
-            1,
-            10,
-            100,
-            1_000_000_000,
-            i64::MAX as i128,
-            i128::MAX,
-        ];
+    fn narrowing_and_sign_errors() {
+        assert_eq!(Elen::from(256u16).decode_u8(), Err(Error::OutOfRange));
+        assert_eq!(Elen::from(-1i8).decode_u64(), Err(Error::OutOfRange));
+        assert_eq!(Elen::from(128i16).decode_i8(), Err(Error::OutOfRange));
+        assert_eq!(Elen::from(-128i16).decode_i8(), Ok(-128));
+        assert_eq!(Elen::from(-129i16).decode_i8(), Err(Error::OutOfRange));
+        assert_eq!(Elen::from(u64::MAX).decode_i64(), Err(Error::OutOfRange));
+        assert_eq!(
+            Elen::from(u32::MAX as u64 + 1).decode_u32(),
+            Err(Error::OutOfRange)
+        );
+        let big: Elen = Elen::from(u128::MAX);
+        assert_eq!(u64::try_from(&big), Err(Error::OutOfRange));
+        assert_eq!(u128::try_from(big), Ok(u128::MAX));
+    }
 
-        let encoded: Vec<String> = values.iter().map(|&v| encode_i128(v)).collect();
-
-        // Verify that encoded strings maintain sort order
-        for i in 0..encoded.len() - 1 {
+    /// Strings that are not exactly the encoder's spelling of a number must be refused, and
+    /// never panic.
+    #[test]
+    fn malformed_and_non_canonical_tokens_error() {
+        for bad in [
+            "",        // empty
+            ";",       // markers only
+            ";;",      //
+            ";;;",     //
+            "-",       //
+            ";x",      // not a digit
+            "5",       // no marker
+            ";05",     // zero magnitude, then trailing
+            ";0",      // zero is `0`
+            "-9",      // `-9` is the negated zero
+            "5xyz",    //
+            ";;2+1",   // `+` is not a digit, even though `u128::from_str` takes it
+            ";;11",    // a length of 1 is never prefixed
+            ";;05",    // a zero length
+            ";;9x",    // truncated
+            ";;99",    // truncated
+            ";;212x",  // trailing input
+            "00",      // trailing input after zero
+            ";-1",     // mixed markers
+            "-;1",     //
+            "!;5",     // the old signed prefixes
+            "~;5",     //
+            ";;2١٢",   // non-ASCII digits
+            ";\u{e9}", // non-ASCII
+        ] {
+            assert!(bad.parse::<Elen>().is_err(), "{bad:?} must be refused");
             assert!(
-                encoded[i] < encoded[i + 1],
-                "Ordering violated: encode_i128({}) = '{}' should be < encode_i128({}) = '{}'",
-                values[i],
-                encoded[i],
-                values[i + 1],
-                encoded[i + 1]
+                Elen(bad.to_owned()).decode_i128().is_err(),
+                "decode_i128({bad:?}) must error"
             );
-        }
-    }
-
-    #[test]
-    fn i64_conversions() {
-        let test_values: Vec<i64> = vec![i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX];
-
-        for input in test_values {
-            let elen: Elen = input.into();
-            let output: i64 = elen.try_into().unwrap();
-            assert_eq!(input, output);
-        }
-    }
-
-    #[test]
-    fn conversions() {
-        let input_u8: u8 = u8::MAX;
-        let mut elen: Elen = input_u8.into();
-        let mut output_u8: Result<u8, ElenError> = elen.try_into();
-        assert_eq!(input_u8, output_u8.unwrap());
-
-        let input_u16: u16 = u8::MAX as u16 + 1;
-        elen = input_u16.into();
-        output_u8 = elen.try_into();
-        assert!(output_u8.is_err());
-        elen = input_u16.into();
-        let mut output_u16: Result<u16, ElenError> = elen.try_into();
-        assert_eq!(input_u16, output_u16.unwrap());
-
-        let input_u32: u32 = u16::MAX as u32 + 1;
-        elen = input_u32.into();
-        output_u16 = elen.try_into();
-        assert!(output_u16.is_err());
-        elen = input_u32.into();
-        let mut output_u32: Result<u32, ElenError> = elen.try_into();
-        assert_eq!(input_u32, output_u32.unwrap());
-
-        let input_u64: u64 = u32::MAX as u64 + 1;
-        elen = input_u64.into();
-        output_u32 = elen.try_into();
-        assert!(output_u32.is_err());
-        elen = input_u64.into();
-        let mut output_u64: Result<u64, ElenError> = elen.try_into();
-        assert_eq!(input_u64, output_u64.unwrap());
-
-        let input_usize: usize = u32::MAX as usize + 1;
-        elen = input_usize.into();
-        output_u32 = elen.try_into();
-        assert!(output_u32.is_err());
-        elen = input_usize.into();
-        let mut output_usize: Result<usize, ElenError> = elen.try_into();
-        assert_eq!(input_usize, output_usize.unwrap());
-
-        let input_u128: u128 = u64::MAX as u128 + 1;
-        elen = input_u128.into();
-        output_u64 = elen.try_into();
-        assert!(output_u64.is_err());
-        elen = input_u128.into();
-        output_usize = elen.try_into();
-        assert!(output_usize.is_err());
-        elen = input_u128.into();
-        let output_u128: Result<u128, ElenError> = elen.try_into();
-        assert_eq!(input_u128, output_u128.unwrap());
-    }
-
-    /// A malformed/degenerate ELEN token must return `Err`, never panic — the decoders index
-    /// slices whose bounds come from the (untrusted) token, so a corrupt key on disk could otherwise
-    /// unwind through `SlateDbKey::decode`'s `Result` contract (#250).
-    #[test]
-    fn malformed_tokens_error_not_panic() {
-        // Empty, all-delimiter, and degenerate length prefixes (the reproductions from #250).
-        // (";9" is intentionally absent — it is the *valid* encoding of 9.)
-        for bad in ["", ";", ";;", ";;;", ";x", "!", "~", "!;", "~;"] {
             assert!(
-                decode_u128(bad).is_err(),
-                "decode_u128({bad:?}) must error, not panic"
-            );
-            // FromStr validates via decode_u128, so `parse::<Elen>()` (every key decode arm) is safe.
-            assert!(
-                bad.parse::<Elen>().is_err(),
-                "{bad:?}.parse::<Elen>() must error, not panic"
-            );
-        }
-        // Signed decode shares the same slicing (`decode_i128` → `decode_u128`).
-        for bad in ["!", "~", "!!", "~;", "!;x"] {
-            assert!(
-                decode_i128(bad).is_err(),
-                "decode_i128({bad:?}) must error, not panic"
+                Elen(bad.to_owned()).decode_u128().is_err(),
+                "decode_u128({bad:?}) must error"
             );
         }
     }
 
-    /// A length prefix claiming an enormous element length must error, not panic or over-read
-    /// (guards the `usize`/bounds arithmetic in `elen_slice`).
     #[test]
-    fn oversized_length_prefix_errors() {
-        // ";;9x": total_elements=2 ⇒ read a 1-char length "9", then try to read a 9-char element from
-        // a 1-char remainder ("x") — must be an out-of-bounds error, not a panic.
-        assert!(decode_u128(";;9x").is_err());
-        assert!(decode_u128(";;99").is_err());
+    fn oversized_tokens_are_out_of_range_without_reading_them() {
+        // Deeper than any u64 encoding, and a length longer than any u64 has digits.
+        assert_eq!(Elen(";;;;2".into()).decode_u64(), Err(Error::OutOfRange));
+        assert_eq!(Elen(";;;299".into()).decode_u64(), Err(Error::OutOfRange));
+        // A length that overflows `usize`.
+        let huge = format!(";;;;299{}", "9".repeat(99));
+        assert!(huge.parse::<Elen>().is_err());
+    }
+
+    #[test]
+    fn error_positions() {
+        assert_eq!(
+            ";;2+1".parse::<Elen>(),
+            Err(Error::UnexpectedChar { at: 3, found: '+' })
+        );
+        assert_eq!(
+            ";;212x".parse::<Elen>(),
+            Err(Error::TrailingInput { at: 5 })
+        );
+        assert_eq!(";;11".parse::<Elen>(), Err(Error::NonCanonical { at: 2 }));
+        assert_eq!(";;99".parse::<Elen>(), Err(Error::UnexpectedEnd));
+        assert_eq!("".parse::<Elen>(), Err(Error::Empty));
     }
 }
