@@ -2,9 +2,30 @@
 name = "elen"
 version = "0.1.0-dev"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["Bobby Calderwood <bobby@evidentsystems.com>"]
 license = "MIT OR Apache-2.0"
 description = "Efficient Lexicographic Encoding of Numbers: order-preserving text encodings"
 keywords = ["encoding", "lexicographic", "sortable", "keys", "elen"]
 categories = ["encoding", "no-std", "database"]
+
+[features]
+default = ["alloc"]
+alloc = []
+serde = ["dep:serde", "alloc"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+ordcode = "0.2.2"
+proptest = "1"
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[bench]]
+name = "codec"
+harness = false

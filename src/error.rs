@@ -38,6 +38,19 @@ pub enum Error {
     NotFinite,
 }
 
+impl Error {
+    /// The same error, with positions shifted `by` bytes: for an error reading a string that
+    /// started `by` bytes into the caller's.
+    pub(crate) fn offset(self, by: usize) -> Self {
+        match self {
+            Error::UnexpectedChar { at, found } => Error::UnexpectedChar { at: at + by, found },
+            Error::NonCanonical { at } => Error::NonCanonical { at: at + by },
+            Error::TrailingInput { at } => Error::TrailingInput { at: at + by },
+            other => other,
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

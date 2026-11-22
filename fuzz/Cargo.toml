@@ -1,0 +1,19 @@
+[package]
+name = "elen-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+elen = { path = ".." }
+
+[[bin]]
+name = "decode_int"
+path = "fuzz_targets/decode_int.rs"
+test = false
+doc = false
+bench = false

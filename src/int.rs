@@ -19,7 +19,7 @@ const NEGATIVE_BYTE: u8 = NEGATIVE as u8;
 const ZERO_BYTE: u8 = ZERO as u8;
 
 /// Number of decimal digits in `n` (1 for 0).
-pub(crate) const fn decimal_len(mut n: u128) -> usize {
+pub(crate) const fn decimal_len(mut n: usize) -> usize {
     let mut len = 1;
     while n >= 10 {
         n /= 10;
@@ -28,41 +28,138 @@ pub(crate) const fn decimal_len(mut n: u128) -> usize {
     len
 }
 
+/// Number of decimal digits in `n` (1 for 0).
+pub(crate) const fn u128_decimal_len(n: u128) -> usize {
+    if n <= u64::MAX as u128 {
+        let mut n = n as u64;
+        let mut len = 1;
+        while n >= 10 {
+            n /= 10;
+            len += 1;
+        }
+        len
+    } else {
+        19 + u128_decimal_len(n / TEN_POW_19 as u128)
+    }
+}
+
 /// Number of markers in the encoding of a magnitude with `len` digits.
-const fn depth(len: usize) -> usize {
+pub(crate) const fn depth(len: usize) -> usize {
     let mut depth = 1;
     let mut len = len;
     while len > 1 {
         depth += 1;
-        len = decimal_len(len as u128);
+        len = decimal_len(len);
     }
     depth
 }
 
-/// Writes the ASCII decimal digits of `n` into the end of `buf`, returning them.
-fn u128_digits(mut n: u128, buf: &mut [u8; 39]) -> &[u8] {
-    let mut start = buf.len();
-    loop {
-        start -= 1;
-        buf[start] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            return &buf[start..];
-        }
+/// 10¹⁹, the largest power of ten in a `u64`.
+const TEN_POW_19: u64 = 10_000_000_000_000_000_000;
+
+const DIGIT_PAIRS: &[u8; 200] = b"\
+    0001020304050607080910111213141516171819\
+    2021222324252627282930313233343536373839\
+    4041424344454647484950515253545556575859\
+    6061626364656667686970717273747576777879\
+    8081828384858687888990919293949596979899";
+
+/// Writes the ASCII decimal digits of `n` into `buf` ending at `end`, zero-padded to at least
+/// `width` digits, two at a time. Returns where they start.
+fn u64_digits(mut n: u64, buf: &mut [u8], mut end: usize, width: usize) -> usize {
+    let floor = end - width;
+    while n >= 100 {
+        let pair = (n % 100) as usize * 2;
+        n /= 100;
+        end -= 2;
+        buf[end..end + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
     }
+    if n >= 10 {
+        let pair = n as usize * 2;
+        end -= 2;
+        buf[end..end + 2].copy_from_slice(&DIGIT_PAIRS[pair..pair + 2]);
+    } else {
+        end -= 1;
+        buf[end] = b'0' + n as u8;
+    }
+    while end > floor {
+        end -= 1;
+        buf[end] = b'0';
+    }
+    end
 }
 
-/// Writes ASCII `digits`, replacing each `d` with `9 - d` when `invert`.
-fn write_digits<W: Write + ?Sized>(w: &mut W, digits: &[u8], invert: bool) -> fmt::Result {
-    let mut buf = [0u8; 64];
-    for chunk in digits.chunks(buf.len()) {
-        let out = &mut buf[..chunk.len()];
-        for (o, &d) in out.iter_mut().zip(chunk) {
-            *o = if invert { b'9' - d + b'0' } else { d };
+/// Writes the ASCII decimal digits of `n` into the end of `buf`, returning them.
+fn u128_digits(n: u128, buf: &mut [u8; 39]) -> &[u8] {
+    // `u128` division is slow; split off 19-digit chunks so the per-digit work is on `u64`s.
+    let mut end = buf.len();
+    let mut high = n;
+    let low = loop {
+        if let Ok(low) = u64::try_from(high) {
+            break low;
         }
-        w.write_str(core::str::from_utf8(out).map_err(|_| fmt::Error)?)?;
+        let chunk = (high % TEN_POW_19 as u128) as u64;
+        high /= TEN_POW_19 as u128;
+        end = u64_digits(chunk, buf, end, 19);
+    };
+    let start = u64_digits(low, buf, end, 1);
+    &buf[start..]
+}
+
+/// Buffers ASCII bytes on the stack, so a writer sees a few `write_str` calls rather than one per
+/// byte.
+struct Out<'w, W: Write + ?Sized> {
+    w: &'w mut W,
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl<'w, W: Write + ?Sized> Out<'w, W> {
+    fn new(w: &'w mut W) -> Self {
+        Out {
+            w,
+            buf: [0; 64],
+            len: 0,
+        }
     }
-    Ok(())
+
+    fn push(&mut self, b: u8) -> fmt::Result {
+        if self.len == self.buf.len() {
+            self.flush()?;
+        }
+        self.buf[self.len] = b;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Pushes ASCII `digits`, replacing each `d` with `9 - d` when `invert`.
+    fn digits(&mut self, mut digits: &[u8], invert: bool) -> fmt::Result {
+        while !digits.is_empty() {
+            if self.len == self.buf.len() {
+                self.flush()?;
+            }
+            let n = digits.len().min(self.buf.len() - self.len);
+            let (chunk, rest) = digits.split_at(n);
+            let out = &mut self.buf[self.len..self.len + n];
+            if invert {
+                for (o, &d) in out.iter_mut().zip(chunk) {
+                    *o = b'9' - d + b'0';
+                }
+            } else {
+                out.copy_from_slice(chunk);
+            }
+            self.len += n;
+            digits = rest;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> fmt::Result {
+        let s = core::str::from_utf8(&self.buf[..self.len]).map_err(|_| fmt::Error)?;
+        self.w.write_str(s)?;
+        self.len = 0;
+        Ok(())
+    }
 }
 
 /// Writes the encoding of a nonzero magnitude given as ASCII `digits` without a leading zero.
@@ -81,17 +178,23 @@ pub(crate) fn write_magnitude<W: Write + ?Sized>(
     while len > 1 {
         chain[links] = len;
         links += 1;
-        len = decimal_len(len as u128);
+        len = decimal_len(len);
     }
-    let marker = if negative { NEGATIVE } else { POSITIVE };
+    let mut out = Out::new(w);
+    let marker = if negative {
+        NEGATIVE_BYTE
+    } else {
+        POSITIVE_BYTE
+    };
     for _ in 0..=links {
-        w.write_char(marker)?;
+        out.push(marker)?;
     }
     let mut buf = [0u8; 39];
     for &link in chain[..links].iter().rev() {
-        write_digits(w, u128_digits(link as u128, &mut buf), negative)?;
+        out.digits(u128_digits(link as u128, &mut buf), negative)?;
     }
-    write_digits(w, digits, negative)
+    out.digits(digits, negative)?;
+    out.flush()
 }
 
 /// Length of the encoding of a nonzero magnitude with `len` digits.
@@ -99,7 +202,7 @@ pub(crate) fn magnitude_encoded_len(len: usize) -> usize {
     let mut total = 1 + len;
     let mut len = len;
     while len > 1 {
-        len = decimal_len(len as u128);
+        len = decimal_len(len);
         total += 1 + len;
     }
     total
@@ -123,18 +226,22 @@ pub(crate) struct Token<'a> {
 }
 
 impl Token<'_> {
-    /// The magnitude's digit values (0–9), most significant first.
-    pub(crate) fn digits(&self) -> impl ExactSizeIterator<Item = u8> + '_ {
-        let negative = self.sign == Sign::Negative;
-        self.group
-            .iter()
-            .map(move |&b| if negative { b'9' - b } else { b - b'0' })
-    }
-
     /// The magnitude as a `u128`, if it fits.
     pub(crate) fn magnitude_u128(&self) -> Option<u128> {
-        self.digits()
-            .try_fold(0u128, |acc, d| acc.checked_mul(10)?.checked_add(d as u128))
+        let negative = self.sign == Sign::Negative;
+        let value = |b: u8| (if negative { b'9' - b } else { b - b'0' }) as u64;
+        // Up to 19 digits always fit a `u64`; only longer magnitudes need `u128` arithmetic.
+        let (head, tail) = self.group.split_at(self.group.len().saturating_sub(19));
+        let tail_value = tail.iter().fold(0u64, |acc, &b| acc * 10 + value(b));
+        if head.is_empty() {
+            return Some(tail_value as u128);
+        }
+        head.iter()
+            .try_fold(0u128, |acc, &b| {
+                acc.checked_mul(10)?.checked_add(value(b) as u128)
+            })?
+            .checked_mul(10u128.pow(tail.len() as u32))?
+            .checked_add(tail_value as u128)
     }
 }
 
@@ -146,8 +253,9 @@ fn unexpected(s: &str, at: usize) -> Error {
 }
 
 /// Reads one canonical integer token from the front of `s`, refusing (with
-/// [`Error::OutOfRange`]) any magnitude longer than `max_digits` before reading it.
-pub(crate) fn read(s: &str, max_digits: usize) -> Result<Token<'_>, Error> {
+/// [`Error::OutOfRange`]) any magnitude longer than `max_digits` before reading it. `max_depth`
+/// is `depth(max_digits)`.
+pub(crate) fn read(s: &str, max_digits: usize, max_depth: usize) -> Result<Token<'_>, Error> {
     let bytes = s.as_bytes();
     let marker = match bytes.first() {
         None => return Err(Error::Empty),
@@ -163,7 +271,7 @@ pub(crate) fn read(s: &str, max_digits: usize) -> Result<Token<'_>, Error> {
     };
     let negative = marker == NEGATIVE_BYTE;
     let groups = bytes.iter().take_while(|&&b| b == marker).count();
-    if groups > depth(max_digits) {
+    if groups > max_depth {
         return Err(Error::OutOfRange);
     }
     let digit = |b: u8| if negative { b'9' - b } else { b - b'0' };
@@ -217,6 +325,8 @@ pub(crate) fn read(s: &str, max_digits: usize) -> Result<Token<'_>, Error> {
 pub(crate) trait Primitive: Sized + Copy {
     /// Digits in the largest magnitude of the type.
     const MAX_DIGITS: usize;
+    /// Markers in the deepest encoding of the type.
+    const MAX_DEPTH: usize = depth(Self::MAX_DIGITS);
     fn into_parts(self) -> (bool, u128);
     fn from_parts(negative: bool, magnitude: u128) -> Option<Self>;
 }
@@ -224,7 +334,7 @@ pub(crate) trait Primitive: Sized + Copy {
 macro_rules! unsigned {
     ($($t:ty),*) => {$(
         impl Primitive for $t {
-            const MAX_DIGITS: usize = decimal_len(<$t>::MAX as u128);
+            const MAX_DIGITS: usize = u128_decimal_len(<$t>::MAX as u128);
             fn into_parts(self) -> (bool, u128) {
                 (false, self as u128)
             }
@@ -238,7 +348,7 @@ macro_rules! unsigned {
 macro_rules! signed {
     ($($t:ty),*) => {$(
         impl Primitive for $t {
-            const MAX_DIGITS: usize = decimal_len(<$t>::MIN.unsigned_abs() as u128);
+            const MAX_DIGITS: usize = u128_decimal_len(<$t>::MIN.unsigned_abs() as u128);
             fn into_parts(self) -> (bool, u128) {
                 (self < 0, self.unsigned_abs() as u128)
             }
@@ -273,12 +383,12 @@ pub(crate) fn primitive_encoded_len<T: Primitive>(v: T) -> usize {
     if magnitude == 0 {
         1
     } else {
-        magnitude_encoded_len(decimal_len(magnitude))
+        magnitude_encoded_len(u128_decimal_len(magnitude))
     }
 }
 
 pub(crate) fn decode_primitive_prefix<T: Primitive>(s: &str) -> Result<(T, &str), Error> {
-    let token = read(s, T::MAX_DIGITS)?;
+    let token = read(s, T::MAX_DIGITS, T::MAX_DEPTH)?;
     let value = match token.sign {
         Sign::Zero => T::from_parts(false, 0),
         sign => token
