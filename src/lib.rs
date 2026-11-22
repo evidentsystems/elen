@@ -41,10 +41,25 @@
 //! Every byte of an encoding is printable ASCII, from `!` (0x21) to `~` (0x7E), so any byte
 //! below `!` works as a separator between an encoding and other text.
 //!
+//! # Number lines
+//!
+//! Encodings compare correctly within a number line, not across lines:
+//!
+//! - **Integers** (§3): every primitive integer type, [`Elen`], and with `num-bigint`,
+//!   `BigInt` and `BigUint`.
+//! - **Reals** ([`real`], §6): `f32` and `f64` (encoded through [`NotNan`]), and with features,
+//!   `rust_decimal::Decimal` and `bigdecimal::BigDecimal`. The exponent comes first, so very
+//!   large and very small magnitudes stay short. `1.0` is `;;11-`.
+//! - **Fixed-point reals** ([`Fixed`], §5): the decimal types in integer-then-fraction form,
+//!   which reads like an ordinary decimal. `1.0` is `;1-`.
+//!
 //! # Features
 //!
-//! - `alloc` (default): [`Elen`], [`encode`], and the `String` conversions.
+//! - `alloc` (default): [`Elen`], [`encode`], [`decode_rounded`], and the `String` conversions.
 //! - `serde`: `Serialize` and `Deserialize` for [`Elen`], as a validated string.
+//! - `num-bigint`: `BigInt` and `BigUint` on the integer line.
+//! - `rust_decimal`: `Decimal` on the real line and as [`Fixed`].
+//! - `bigdecimal`: `BigDecimal` on the real line and as [`Fixed`].
 //!
 //! [paper]: https://www.zanopha.com/docs/elen.pdf
 #![no_std]
@@ -57,13 +72,25 @@ extern crate alloc;
 #[cfg(feature = "alloc")]
 mod elen;
 mod error;
+mod ext {
+    #[cfg(feature = "bigdecimal")]
+    mod bigdecimal;
+    #[cfg(feature = "num-bigint")]
+    mod bigint;
+    #[cfg(feature = "rust_decimal")]
+    mod rust_decimal;
+}
 mod int;
 mod primitive;
+pub mod real;
 mod traits;
 
 #[cfg(feature = "alloc")]
 pub use elen::Elen;
 pub use error::Error;
+#[cfg(feature = "alloc")]
+pub use real::decode_rounded;
+pub use real::{Fixed, NotNan};
 pub use traits::{Decode, Display, Encode, Integer};
 
 /// Marks a positive number; sorts above every digit. The paper's `+`.
@@ -114,6 +141,6 @@ pub fn display<T: Encode + ?Sized>(value: &T) -> Display<'_, T> {
     Display(value)
 }
 
-#[cfg(doctest)]
+#[cfg(all(doctest, feature = "alloc"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;

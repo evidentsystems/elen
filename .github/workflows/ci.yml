@@ -50,3 +50,5 @@ jobs:
       - uses: taiki-e/install-action@cargo-fuzz
       - run: cargo fuzz run decode_int -- -max_total_time=60
         working-directory: fuzz
+      - run: cargo fuzz run decode_real -- -max_total_time=60
+        working-directory: fuzz

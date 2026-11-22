@@ -90,7 +90,7 @@ fn u64_digits(mut n: u64, buf: &mut [u8], mut end: usize, width: usize) -> usize
 }
 
 /// Writes the ASCII decimal digits of `n` into the end of `buf`, returning them.
-fn u128_digits(n: u128, buf: &mut [u8; 39]) -> &[u8] {
+pub(crate) fn u128_digits(n: u128, buf: &mut [u8; 39]) -> &[u8] {
     // `u128` division is slow; split off 19-digit chunks so the per-digit work is on `u64`s.
     let mut end = buf.len();
     let mut high = n;
@@ -108,14 +108,14 @@ fn u128_digits(n: u128, buf: &mut [u8; 39]) -> &[u8] {
 
 /// Buffers ASCII bytes on the stack, so a writer sees a few `write_str` calls rather than one per
 /// byte.
-struct Out<'w, W: Write + ?Sized> {
+pub(crate) struct Out<'w, W: Write + ?Sized> {
     w: &'w mut W,
     buf: [u8; 64],
     len: usize,
 }
 
 impl<'w, W: Write + ?Sized> Out<'w, W> {
-    fn new(w: &'w mut W) -> Self {
+    pub(crate) fn new(w: &'w mut W) -> Self {
         Out {
             w,
             buf: [0; 64],
@@ -123,7 +123,7 @@ impl<'w, W: Write + ?Sized> Out<'w, W> {
         }
     }
 
-    fn push(&mut self, b: u8) -> fmt::Result {
+    pub(crate) fn push(&mut self, b: u8) -> fmt::Result {
         if self.len == self.buf.len() {
             self.flush()?;
         }
@@ -133,7 +133,7 @@ impl<'w, W: Write + ?Sized> Out<'w, W> {
     }
 
     /// Pushes ASCII `digits`, replacing each `d` with `9 - d` when `invert`.
-    fn digits(&mut self, mut digits: &[u8], invert: bool) -> fmt::Result {
+    pub(crate) fn digits(&mut self, mut digits: &[u8], invert: bool) -> fmt::Result {
         while !digits.is_empty() {
             if self.len == self.buf.len() {
                 self.flush()?;
@@ -154,7 +154,16 @@ impl<'w, W: Write + ?Sized> Out<'w, W> {
         Ok(())
     }
 
-    fn flush(&mut self) -> fmt::Result {
+    /// Pushes `n` zeros, or nines when `invert`.
+    pub(crate) fn zeros(&mut self, n: usize, invert: bool) -> fmt::Result {
+        let digit = if invert { b'9' } else { b'0' };
+        for _ in 0..n {
+            self.push(digit)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> fmt::Result {
         let s = core::str::from_utf8(&self.buf[..self.len]).map_err(|_| fmt::Error)?;
         self.w.write_str(s)?;
         self.len = 0;
@@ -168,19 +177,31 @@ pub(crate) fn write_magnitude<W: Write + ?Sized>(
     negative: bool,
     digits: &[u8],
 ) -> fmt::Result {
+    let mut out = Out::new(w);
+    push_magnitude(&mut out, negative, digits, 0)?;
+    out.flush()
+}
+
+/// Pushes the encoding of a nonzero magnitude: ASCII `digits` without a leading zero, followed by
+/// `zeros` more zeros.
+pub(crate) fn push_magnitude<W: Write + ?Sized>(
+    out: &mut Out<'_, W>,
+    negative: bool,
+    digits: &[u8],
+    zeros: usize,
+) -> fmt::Result {
     debug_assert!(!digits.is_empty() && digits[0] != b'0');
     // The length chain: `chain[0]` is the number of digits, each later entry the length of the
     // one before, stopping at the first single-digit length. A `usize` has at most 20 digits, so
     // the chain is at most 3 long.
     let mut chain = [0usize; 4];
     let mut links = 0;
-    let mut len = digits.len();
+    let mut len = digits.len() + zeros;
     while len > 1 {
         chain[links] = len;
         links += 1;
         len = decimal_len(len);
     }
-    let mut out = Out::new(w);
     let marker = if negative {
         NEGATIVE_BYTE
     } else {
@@ -194,7 +215,7 @@ pub(crate) fn write_magnitude<W: Write + ?Sized>(
         out.digits(u128_digits(link as u128, &mut buf), negative)?;
     }
     out.digits(digits, negative)?;
-    out.flush()
+    out.zeros(zeros, negative)
 }
 
 /// Length of the encoding of a nonzero magnitude with `len` digits.
@@ -225,7 +246,12 @@ pub(crate) struct Token<'a> {
     pub(crate) end: usize,
 }
 
-impl Token<'_> {
+impl<'a> Token<'a> {
+    /// The magnitude's digit group as written: inverted when negative, empty for zero.
+    pub(crate) fn group(&self) -> &'a [u8] {
+        self.group
+    }
+
     /// The magnitude as a `u128`, if it fits.
     pub(crate) fn magnitude_u128(&self) -> Option<u128> {
         let negative = self.sign == Sign::Negative;
@@ -245,7 +271,7 @@ impl Token<'_> {
     }
 }
 
-fn unexpected(s: &str, at: usize) -> Error {
+pub(crate) fn unexpected(s: &str, at: usize) -> Error {
     match s[at..].chars().next() {
         Some(found) => Error::UnexpectedChar { at, found },
         None => Error::UnexpectedEnd,
@@ -376,6 +402,15 @@ pub(crate) fn encode_primitive<T: Primitive, W: Write + ?Sized>(v: T, w: &mut W)
     }
     let mut buf = [0u8; 39];
     write_magnitude(w, negative, u128_digits(magnitude, &mut buf))
+}
+
+/// Pushes the encoding of `v`.
+pub(crate) fn push_i128<W: Write + ?Sized>(out: &mut Out<'_, W>, v: i128) -> fmt::Result {
+    if v == 0 {
+        return out.push(ZERO_BYTE);
+    }
+    let mut buf = [0u8; 39];
+    push_magnitude(out, v < 0, u128_digits(v.unsigned_abs(), &mut buf), 0)
 }
 
 pub(crate) fn primitive_encoded_len<T: Primitive>(v: T) -> usize {

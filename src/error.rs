@@ -35,7 +35,7 @@ pub enum Error {
         at: usize,
     },
     /// A NaN, which has no place in numeric order.
-    NotFinite,
+    NaN,
 }
 
 impl Error {
@@ -62,7 +62,7 @@ impl fmt::Display for Error {
             Error::NonCanonical { at } => write!(f, "non-canonical encoding at byte {at}"),
             Error::OutOfRange => f.write_str("number out of range for the target type"),
             Error::TrailingInput { at } => write!(f, "trailing input at byte {at}"),
-            Error::NotFinite => f.write_str("NaN cannot be encoded"),
+            Error::NaN => f.write_str("NaN has no encoding"),
         }
     }
 }

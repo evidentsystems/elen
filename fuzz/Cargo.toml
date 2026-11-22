@@ -9,11 +9,21 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-elen = { path = ".." }
+elen = { path = "..", features = ["num-bigint", "rust_decimal", "bigdecimal"] }
+bigdecimal = { version = "0.4", default-features = false }
+num-bigint = { version = "0.4", default-features = false }
+rust_decimal = { version = "1", default-features = false }
 
 [[bin]]
 name = "decode_int"
 path = "fuzz_targets/decode_int.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_real"
+path = "fuzz_targets/decode_real.rs"
 test = false
 doc = false
 bench = false

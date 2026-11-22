@@ -13,8 +13,14 @@ categories = ["encoding", "no-std", "database"]
 default = ["alloc"]
 alloc = []
 serde = ["dep:serde", "alloc"]
+num-bigint = ["dep:num-bigint", "alloc"]
+rust_decimal = ["dep:rust_decimal"]
+bigdecimal = ["dep:bigdecimal", "num-bigint"]
 
 [dependencies]
+bigdecimal = { version = "0.4", default-features = false, optional = true }
+num-bigint = { version = "0.4", default-features = false, optional = true }
+rust_decimal = { version = "1", default-features = false, optional = true }
 serde = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
@@ -29,3 +35,4 @@ all-features = true
 [[bench]]
 name = "codec"
 harness = false
+required-features = ["alloc"]

@@ -70,6 +70,50 @@ Every encoding is self-delimiting. `Decode::decode_prefix` reads one from the fr
 string, and concatenated encodings sort field by field. Every byte is printable ASCII, so any
 byte below `!` (for example `\x1f`) works as a separator against surrounding text.
 
+## Reals
+
+Floats and decimals use the paper's §6 floating-point form. A real `±0.d₁…dₙ × 10ᵉ` is written
+as a sign marker, then the exponent `e` as an integer (negated when the real is negative), then
+the digits (inverted when negative), then a terminator. The terminator sorts below the digits
+for positive reals and above them for negative ones. Zero is `0`. Infinities are `!` and `~`,
+which sort below and above every other real.
+
+```text
+ -0.1×10¹¹ → ---7888;       0.00123 → ;-7123-
+      -1.4 → --885;           0.123 → ;0123-
+        -1 → --88;                1 → ;;11-
+    -0.123 → -0876;             1.4 → ;;114-
+         0 → 0             0.1×10¹¹ → ;;;2111-
+```
+
+`f32`, `f64`, `rust_decimal::Decimal` and `bigdecimal::BigDecimal` all write a value the same
+way, so encodings of different real types compare correctly with each other:
+
+```rust
+# #[cfg(feature = "rust_decimal")] {
+use elen::NotNan;
+use rust_decimal::Decimal;
+
+assert_eq!(elen::encode(&NotNan::new(-12.5f64)?), elen::encode(&Decimal::new(-125, 1)));
+# }
+# Ok::<(), elen::Error>(())
+```
+
+- **NaN** has no place in numeric order, so floats are encoded through `NotNan`, which refuses
+  NaN. `-0.0` encodes as `0`.
+- **Exactness.** Decoding refuses a number the target type cannot hold exactly. For example, a
+  30-digit decimal can't be read as an `f64`, and `1e30` can't be read as a `Decimal`.
+  `elen::decode_rounded::<f64>` rounds to the nearest float instead.
+- **Fixed-point.** `Fixed<Decimal>` and `Fixed<BigDecimal>` use the paper's §5 form instead: the
+  integer part, then the fraction. `100.5` is `;;31005-`. These encodings form their own line.
+  §5 is longer for extreme magnitudes but reads like an ordinary decimal.
+- **Paper errata.** The paper's §5 table leaves a one-digit integer part uninverted in
+  negative numbers, for example `-3.14 → -385+`. Those rows would sort out of order (`-385+`
+  sorts after `-198+`, which the paper gives for `-1.01`). This crate inverts every digit of a
+  negative number, as the paper's §3 and its multi-digit §5 rows do: `-3.14 → -685;`.
+
+Integers and reals are different number lines: `1u8` is `;1`, while `1.0` is `;;11-`.
+
 ## Strictness
 
 Decoding accepts only the encoder's own spelling of each value. If `T::decode(s)` returns
@@ -83,14 +127,21 @@ Decoding accepts only the encoder's own spelling of each value. If `T::decode(s)
   `Error::OutOfRange` before the digits are read.
 
 If equal numbers could have different spellings, equality lookups and range scans over encoded
-keys would silently miss data. This rule rules that out. Property tests and a fuzz target check
-it.
+keys would silently miss data. Strict decoding rules that out. Property tests and fuzz targets check
+it, for every type.
 
 ## Features
 
-- `alloc` (default): `Elen`, `encode`, and `String` conversions. Without it the crate is
-  `no_std` with no allocation: use `Encode::encode_into` or `elen::display`.
+- `alloc` (default): `Elen`, `encode`, `decode_rounded`, and `String` conversions. Without it
+  the crate is `no_std` with no allocation: use `Encode::encode_into` or `elen::display`.
+  Primitive integers and floats work either way.
 - `serde`: `Serialize` and `Deserialize` for `Elen`, as a validated string.
+- `num-bigint`: `BigInt` and `BigUint` on the integer line.
+- `rust_decimal`: `Decimal` on the real line and as `Fixed<Decimal>`.
+- `bigdecimal`: `BigDecimal` on the real line and as `Fixed<BigDecimal>`.
+
+Decoding a bigint or `BigDecimal` checks the input in linear time but then parses it in
+superlinear time, so limit the length of untrusted input.
 
 The minimum supported Rust version is 1.88.
 
